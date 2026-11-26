@@ -20,6 +20,8 @@ Supported operations:
 - FP32 accumulation with FP16/BF16 inputs (SM80+)
 - TF32 operations (SM80+)
 - FP8 operations (SM89+)
+- INT8/UINT8 operations with INT32 accumulation (SM75+/SM80+)
+- FP64 operations (SM80+/SM90+)
 
 Reference: https://docs.nvidia.com/cuda/parallel-thread-execution/
 """
@@ -282,6 +284,83 @@ def _mma_nvidia(mut d: SIMD, a: SIMD, b: SIMD, c: SIMD):
             c[3],
         )
         d = rebind[type_of(d)](SIMD[.float32, 4](r[0], r[1], r[2], r[3]))
+
+    # ===------------------------------------------------------------------===#
+    # S32 = {S8, U8} * {S8, U8} + S32
+    # ===------------------------------------------------------------------===#
+    elif (
+        a.dtype in (DType.int8, DType.uint8)
+        and b.dtype in (DType.int8, DType.uint8)
+        and c.dtype == DType.int32
+        and d.dtype == DType.int32
+    ) and _has_shape[(4, 4, 2, 2)](a.length, b.length, c.length, d.length):
+        comptime ab_tag = (
+            "s8" if a.dtype == DType.int8 else "u8"
+        ) if a.dtype == b.dtype else (
+            "s8.u8" if a.dtype == DType.int8 else "u8.s8"
+        )
+        var a0 = bitcast[.int32, 1](a)
+        var b0 = bitcast[.int32, 1](b)
+        var c0 = bitcast[.int32, 2](c)
+
+        var r = llvm_intrinsic[
+            "llvm.nvvm.mma.m8n8k16.row.col." + ab_tag,
+            _RegisterPackType[Int32, Int32],
+        ](a0, b0, c0[0], c0[1])
+        d = rebind[type_of(d)](SIMD[.int32, 2](r[0], r[1]))
+
+    elif (
+        a.dtype in (DType.int8, DType.uint8)
+        and b.dtype in (DType.int8, DType.uint8)
+        and c.dtype == DType.int32
+        and d.dtype == DType.int32
+    ) and _has_shape[(8, 4, 4, 4)](a.length, b.length, c.length, d.length):
+        comptime ab_tag = (
+            "s8" if a.dtype == DType.int8 else "u8"
+        ) if a.dtype == b.dtype else (
+            "s8.u8" if a.dtype == DType.int8 else "u8.s8"
+        )
+        var a0 = bitcast[.int32, 2](a)
+        var b0 = bitcast[.int32, 1](b)
+        var c0 = bitcast[.int32, 4](c)
+
+        var r = llvm_intrinsic[
+            "llvm.nvvm.mma.m16n8k16.row.col." + ab_tag,
+            _RegisterPackType[Int32, Int32, Int32, Int32],
+        ](a0[0], a0[1], b0, c0[0], c0[1], c0[2], c0[3])
+        d = rebind[type_of(d)](SIMD[.int32, 4](r[0], r[1], r[2], r[3]))
+
+    elif (
+        a.dtype in (DType.int8, DType.uint8)
+        and b.dtype in (DType.int8, DType.uint8)
+        and c.dtype == DType.int32
+        and d.dtype == DType.int32
+    ) and _has_shape[(16, 8, 4, 4)](a.length, b.length, c.length, d.length):
+        comptime ab_tag = (
+            "s8" if a.dtype == DType.int8 else "u8"
+        ) if a.dtype == b.dtype else (
+            "s8.u8" if a.dtype == DType.int8 else "u8.s8"
+        )
+        var a0 = bitcast[.int32, 4](a)
+        var b0 = bitcast[.int32, 2](b)
+        var c0 = bitcast[.int32, 4](c)
+
+        var r = llvm_intrinsic[
+            "llvm.nvvm.mma.m16n8k32.row.col." + ab_tag,
+            _RegisterPackType[Int32, Int32, Int32, Int32],
+        ](
+            a0[0],
+            a0[1],
+            a0[2],
+            a0[3],
+            b0[0],
+            b0[1],
+            c0[0],
+            c0[1],
+            c0[2],
+            c0[3],
+        )
+        d = rebind[type_of(d)](SIMD[.int32, 4](r[0], r[1], r[2], r[3]))
 
     # ===------------------------------------------------------------------===#
     # F64 = F64 * F64 + F64

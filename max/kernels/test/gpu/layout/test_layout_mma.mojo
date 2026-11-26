@@ -103,7 +103,7 @@ def test_layout_mma[
     var mat_b_n = HostDeviceTileTensor[in_type](layout_b, ctx)
     var mat_c_n = HostDeviceTileTensor[out_type](layout_c, ctx)
 
-    var rand_min = -1 * rng_width
+    var rand_min = 0.0 if in_type.is_unsigned() else -1 * rng_width
     var rand_max = rng_width
     var mat_a_tensor = mat_a.host_tensor()
     var mat_b_tensor = mat_b.host_tensor()
@@ -185,10 +185,13 @@ def test_layout_mma[
         for j in range(N):
             var out_val = mat_c.host_tensor()[i, j]
             var out_ref = mat_c_n.host_tensor()[i, j]
-            if debug:
-                if not isclose(out_val, out_ref, rtol=rtol):
-                    print(i, out_val, out_ref)
-            assert_true(isclose(out_val, out_ref, rtol=rtol))
+            comptime if out_type.is_integral():
+                assert_equal(out_val, out_ref)
+            else:
+                if debug:
+                    if not isclose(out_val, out_ref, rtol=rtol):
+                        print(i, out_val, out_ref)
+                assert_true(isclose(out_val, out_ref, rtol=rtol))
 
 
 def c_fragment_kernel[
@@ -205,9 +208,10 @@ def c_fragment_kernel[
     loaded: TileTensor[dtype, FragmentLayout, loaded_origin],
 ):
     comptime assert loaded.rank == loaded.flat_rank == 2
-    var tc = TensorCore[
-        dtype, DType.float64 if dtype == .float64 else DType.float16, shape
-    ]()
+    comptime in_dtype = DType.float64 if dtype == .float64 else (
+        DType.int8 if dtype == .int32 else DType.float16
+    )
+    var tc = TensorCore[dtype, in_dtype, shape]()
     var fragment = tc.load_c(c)
     comptime assert fragment.rank == fragment.flat_rank == 2
     comptime registers = shape[0] * shape[1] // WARP_SIZE
@@ -241,10 +245,13 @@ def test_c_fragment_layout[
     var d = HostDeviceTileTensor[dtype](storage_layout, ctx)
     var loaded = HostDeviceTileTensor[dtype](fragment_layout, ctx)
     var expected = HostDeviceTileTensor[dtype](storage_layout)
-    var c_host = c.host_tensor().fill(nan[dtype]())
-    var expected_host = expected.host_tensor().fill(nan[dtype]())
-    _ = d.host_tensor().fill(nan[dtype]())
-    _ = loaded.host_tensor().fill(nan[dtype]())
+    comptime guard_fill = Scalar[dtype](-1) if dtype.is_integral() else nan[
+        dtype
+    ]()
+    var c_host = c.host_tensor().fill(guard_fill)
+    var expected_host = expected.host_tensor().fill(guard_fill)
+    _ = d.host_tensor().fill(guard_fill)
+    _ = loaded.host_tensor().fill(guard_fill)
     for row in range(M):
         for col in range(N):
             c_host[guard_value + row * row_stride + col * col_stride] = Scalar[
@@ -297,10 +304,11 @@ def test_c_fragment_layout[
             ] = Scalar[dtype](lane * registers + register)
     var d_host = d.host_tensor()
     for i in range(storage_size):
-        if isnan(expected_host[i]):
-            assert_true(isnan(d_host[i]))
-        else:
-            assert_equal(d_host[i], expected_host[i])
+        comptime if dtype.is_floating_point():
+            if isnan(expected_host[i]):
+                assert_true(isnan(d_host[i]))
+                continue
+        assert_equal(d_host[i], expected_host[i])
 
 
 def test_c_fragments[
@@ -427,13 +435,37 @@ def main() raises:
     with DeviceContext() as ctx:
         comptime if ctx.target.is_nvidia_gpu():
             comptime shape_884 = DynamicCoord[.int, 3](8, 8, 4)
+            comptime shape_8816 = DynamicCoord[.int, 3](8, 8, 16)
             comptime shape_1684 = DynamicCoord[.int, 3](16, 8, 4)
             comptime shape_1688 = DynamicCoord[.int, 3](16, 8, 8)
             comptime shape_16816 = DynamicCoord[.int, 3](16, 8, 16)
+            comptime shape_16832 = DynamicCoord[.int, 3](16, 8, 32)
 
             test_c_fragments[.float64, shape_884](ctx)
             test_c_fragments[.float64, shape_16816](ctx)
             test_c_fragments[.float32, shape_16816](ctx)
+            test_c_fragments[.int32, shape_8816](ctx)
+            test_c_fragments[.int32, shape_16832](ctx)
+
+            test_layout_mma[.int32, DType.int8, shape_8816, 8, 8, 16](ctx)
+            test_layout_mma[.int32, DType.int8, shape_16816, 16, 8, 16](ctx)
+            test_layout_mma[.int32, DType.int8, shape_16832, 16, 8, 32](ctx)
+            test_layout_mma[.int32, DType.uint8, shape_8816, 8, 8, 16](ctx)
+            test_layout_mma[.int32, DType.uint8, shape_16816, 16, 8, 16](ctx)
+            test_layout_mma[.int32, DType.uint8, shape_16832, 16, 8, 32](ctx)
+
+            assert_equal(
+                get_mma_shape[DType.int8, DType.int32, 0](), (16, 8, 32)
+            )
+            assert_equal(
+                get_mma_shape[DType.int8, DType.int32, 1](), (16, 8, 16)
+            )
+            assert_equal(
+                get_mma_shape[DType.int8, DType.int32, 2](), (8, 8, 16)
+            )
+            assert_equal(
+                get_mma_shape[DType.uint8, DType.int32, 0](), (16, 8, 32)
+            )
 
             test_layout_mma[.float64, DType.float64, shape_884, 8, 8, 4](
                 ctx, rtol=1e-01

@@ -36,12 +36,12 @@ Supported Operations:
 
 Supported Data Types:
 -------------------
-- NVIDIA: float32, bfloat16, float16, float8_e4m3fn, float8_e5m2
+- NVIDIA: float64, float32, bfloat16, float16, float8_e4m3fn, float8_e5m2, int8, uint8
 - AMD: float32, bfloat16, float16
 
 Supported Matrix Shapes:
 ----------------------
-- NVIDIA: 16x8x8, 16x8x4, 16x8x16, 8x8x4, 16x8x32
+- NVIDIA: 16x8x8, 16x8x4, 16x8x16, 8x8x4, 8x8x16, 16x8x32
 - AMD: 16x16x4, 16x16x16, 32x32x8
 """
 
@@ -123,6 +123,8 @@ comptime shape_16x8x16 = DynamicCoord[.int, 3](16, 8, 16)
 """Tensor core shape 16x8x16."""
 comptime shape_8x8x4 = DynamicCoord[.int, 3](8, 8, 4)
 """Tensor core shape 8x8x4."""
+comptime shape_8x8x16 = DynamicCoord[.int, 3](8, 8, 16)
+"""Tensor core shape 8x8x16."""
 comptime shape_16x8x32 = DynamicCoord[.int, 3](16, 8, 32)
 """Tensor core shape 16x8x32."""
 
@@ -205,6 +207,12 @@ struct TensorCore[
         and (Self.shape == shape_16x16x32 or Self.shape == shape_32x32x64)
     )
     """Whether float8 is supported for this tensor core configuration."""
+    comptime supported_int8 = (
+        Self.in_type in (DType.int8, DType.uint8)
+        and Self.out_type == DType.int32
+        and Self.shape == shape_16x8x32
+    ) if is_nvidia_gpu() else False
+    """Whether int8/uint8 is supported for this tensor core configuration."""
 
     # Operand register types.
     comptime a_reg_type = SIMD[
@@ -267,6 +275,8 @@ struct TensorCore[
                 return [shape_16x8x8, shape_8x8x4]
             case (.float32, .float8_e4m3fn) | (.float32, .float8_e5m2):
                 return [shape_16x8x32]
+            case (.int32, .int8) | (.int32, .uint8):
+                return [shape_8x8x16, shape_16x8x16, shape_16x8x32]
             case (.float64, .float64):
                 return [shape_8x8x4, shape_16x8x4, shape_16x8x8, shape_16x8x16]
             case _:
@@ -309,6 +319,13 @@ struct TensorCore[
                     registers in (4, 8) if a_operand else registers in (2, 4)
                 )
                 return 2
+            case .int8 | .uint8:
+                comptime assert (
+                    registers
+                    in (4, 8, 16) if a_operand else registers
+                    in (4, 8)
+                )
+                return 4
             case _:
                 comptime assert Self.in_type in (
                     DType.float8_e4m3fn,
@@ -522,15 +539,17 @@ struct TensorCore[
 
         Constraints:
             The tile must have scalar elements and exactly the MMA M-by-N shape.
-            NVIDIA supports float32 and float64; AMD supports float32.
+            NVIDIA supports float32, float64, and int32; AMD supports float32.
         """
         comptime assert c.rank == c.flat_rank == 2 and c.element_size == 1
         comptime registers = num_matrix_reg[
             Int(Self.shape[0]), Int(Self.shape[1])
         ]()
         comptime if is_nvidia_gpu():
-            comptime assert (Self.out_type == .float32 and registers == 4) or (
-                Self.out_type == .float64 and registers in (2, 4)
+            comptime assert (
+                (Self.out_type == .float32 and registers == 4)
+                or (Self.out_type == .float64 and registers in (2, 4))
+                or (Self.out_type == .int32 and registers in (2, 4))
             )
         else:
             comptime assert Self.out_type == .float32 and registers in (4, 16)
@@ -564,7 +583,7 @@ struct TensorCore[
             The source must have contiguous scalar registers and shape
             (1, registers).
             The destination must have scalar elements and the MMA M-by-N shape.
-            NVIDIA supports float32 and float64; AMD supports float32.
+            NVIDIA supports float32, float64, and int32; AMD supports float32.
         """
         comptime registers = Self.c_reg_type.length
         comptime assert d_src.rank == d_src.flat_rank == 2
@@ -590,8 +609,10 @@ struct TensorCore[
             Int(Self.shape[0]), Int(Self.shape[1])
         ]()
         comptime if is_nvidia_gpu():
-            comptime assert (Self.out_type == .float32 and registers == 4) or (
-                Self.out_type == .float64 and registers in (2, 4)
+            comptime assert (
+                (Self.out_type == .float32 and registers == 4)
+                or (Self.out_type == .float64 and registers in (2, 4))
+                or (Self.out_type == .int32 and registers in (2, 4))
             )
         else:
             comptime assert Self.out_type == .float32 and registers in (
@@ -760,7 +781,10 @@ struct TensorCore[
                 to 0.
         """
         comptime assert (
-            self.supported_fp32 or self.supported_half or self.supported_fp8
+            self.supported_fp32
+            or self.supported_half
+            or self.supported_fp8
+            or self.supported_int8
         )
         comptime assert warp_tile.rank == warp_tile.flat_rank == 2
         comptime assert fragments.rank == fragments.flat_rank == 2
@@ -843,7 +867,10 @@ struct TensorCore[
                 Defaults to 0.
         """
         comptime assert (
-            self.supported_fp32 or self.supported_half or self.supported_fp8
+            self.supported_fp32
+            or self.supported_half
+            or self.supported_fp8
+            or self.supported_int8
         )
         comptime assert warp_tile.rank == warp_tile.flat_rank == 2
         comptime assert fragments.rank == fragments.flat_rank == 2
@@ -891,9 +918,13 @@ struct TensorCore[
                             (i + 1, 0), SIMD[Self.in_type, 2](vec[1], vec[3])
                         )
                 else:
-                    comptime assert self.supported_half or self.supported_fp8, (
-                        "Transposed matrix B is only supported for half and fp8"
-                        " data types."
+                    comptime assert (
+                        self.supported_half
+                        or self.supported_fp8
+                        or self.supported_int8
+                    ), (
+                        "Transposed matrix B is only supported for half, fp8,"
+                        " and int8/uint8 data types."
                     )
                     comptime assert frag_width == 8 // size_of[Self.in_type]()
                     comptime for i in range(0, num_frags, 2):
@@ -932,7 +963,10 @@ struct TensorCore[
                                     ),
                                 ),
                             )
-                    case _ if Self.in_type.is_float8():
+                    case _ if Self.in_type.is_float8() or Self.in_type in (
+                        DType.int8,
+                        DType.uint8,
+                    ):
                         # mma.m16n8k32 B: four consecutive k rows starting at
                         # 4 * (lane % 4), then the same rows 16 further on,
                         # all at n = lane // 4.
@@ -1344,6 +1378,14 @@ def get_mma_shape[
                         return (8, 8, 4)
             case (.float32, .float8_e4m3fn) | (.float32, .float8_e5m2):
                 return (16, 8, 32)
+            case (.int32, .int8) | (.int32, .uint8):
+                comptime match shape_id:
+                    case 0:
+                        return (16, 8, 32)
+                    case 1:
+                        return (16, 8, 16)
+                    case _:
+                        return (8, 8, 16)
             case _:
                 comptime assert False, "Unsupported mma shape."
     else:

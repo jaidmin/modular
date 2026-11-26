@@ -212,7 +212,7 @@ def mma(mut d: SIMD, a: SIMD, b: SIMD, c: SIMD):
     The operation performed is: d = (a * b) + c
 
     Supported configurations depend on the GPU architecture:
-    - NVIDIA: Various combinations of FP32, FP16, BF16, and FP8 formats
+    - NVIDIA: Various combinations of FP64, FP32, FP16, BF16, FP8, and INT8/UINT8 formats
     - AMD: Limited subset of FP32 and FP16 operations
 
     Note:
